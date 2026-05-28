@@ -115,14 +115,7 @@ def ai(system, user, max_tokens=300):
             extra_body={"reasoning": {"effort": "high", "exclude": True}}
         )
         result = r.choices[0].message.content.strip()
-        # Убираем reasoning-блоки если модель думает вслух
-        # Берём только последний абзац после размышлений
-        if "Let's" in result or "So we need" in result or "Need to" in result:
-            # Берём последнее предложение на русском
-            sentences = [s.strip() for s in result.split(".") if any(ord(c) > 127 for c in s)]
-            if sentences:
-                result = sentences[-1].strip("., ") + "."
-        return result
+        return strip_reasoning(result)
     except Exception as e:
         logger.error(f"Ошибка AI: {e}")
         return None
@@ -219,16 +212,54 @@ def build_prompt(messages, style, filter_desc):
     )
 
 
+# ─── Очистка reasoning из ответа модели ──────────────────────────────────────
+def strip_reasoning(text: str) -> str:
+    """Убирает цепочки размышлений если модель думает вслух."""
+    # Убираем <think>...</think> блоки
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
+    # Маркеры английских рассуждений — если встречаются, берём только последний русский абзац
+    reasoning_markers = [
+        "Let's craft", "Let's ", "So we need", "Need to", "I need to",
+        "I should", "I'll ", "We need", "This is", "The message",
+        "This appears", "This seems", "Let me", "First,", "Now,",
+    ]
+    has_reasoning = any(marker in text for marker in reasoning_markers)
+
+    if has_reasoning:
+        # Разбиваем на абзацы и берём последний русский
+        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+        ru_paragraphs = []
+        for p in paragraphs:
+            ru_chars = sum(1 for c in p if 'а' <= c.lower() <= 'я' or c.lower() == 'ё')
+            if len(p) > 0 and ru_chars / len(p) > 0.25:
+                ru_paragraphs.append(p)
+        if ru_paragraphs:
+            return ru_paragraphs[-1]
+
+        # Если абзацев нет — берём последнее русское предложение
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        ru_sentences = []
+        for s in sentences:
+            ru_chars = sum(1 for c in s if 'а' <= c.lower() <= 'я' or c.lower() == 'ё')
+            if len(s) > 0 and ru_chars / len(s) > 0.25:
+                ru_sentences.append(s)
+        if ru_sentences:
+            return ru_sentences[-1]
+
+    return text
+
+
 # ─── Отправка резюме (общая функция) ─────────────────────────────────────────
-async def do_summary(chat_id, style, count, since, filter_parts, send_fn, delete_fn):
+async def do_summary(chat_id, style, count, since, filter_parts, send_fn, edit_fn, delete_fn):
     filtered = db_get(chat_id, limit=count, since=since)
     if not filtered:
         desc = " ".join(filter_parts) or "сохранённых сообщений"
-        await send_fn(f"📭 Нет сообщений {desc}. Напиши что-нибудь в чате!")
-        await delete_fn()
+        await edit_fn(f"📭 Нет сообщений {desc}. Напиши что-нибудь в чате!")
         return
     filter_desc = f" ({', '.join(filter_parts)})" if filter_parts else ""
     style_label = {"bullets": " • тезисы", "short": " • кратко", "default": ""}.get(style, "")
+    await edit_fn("⏳ Запрос в обработке, подожди...")
     try:
         prompt = build_prompt(filtered, style, filter_desc)
         response = client.chat.completions.create(
@@ -237,6 +268,8 @@ async def do_summary(chat_id, style, count, since, filter_parts, send_fn, delete
             extra_body={"reasoning": {"effort": "high", "exclude": True}}
         )
         text = response.choices[0].message.content
+        # Пункт 3: убираем reasoning если модель всё равно думает вслух
+        text = strip_reasoning(text)
         full = f"📋 Резюме {len(filtered)} сообщений{filter_desc}{style_label}:\n\n{text}"
         chunks = [full[i:i+4096] for i in range(0, len(full), 4096)]
         await delete_fn()
@@ -244,8 +277,7 @@ async def do_summary(chat_id, style, count, since, filter_parts, send_fn, delete
             await send_fn(chunk)
     except Exception as e:
         logger.error(f"Ошибка OpenRouter: {e}")
-        await delete_fn()
-        await send_fn("❌ Не удалось получить суммаризацию. Попробуй позже.")
+        await edit_fn("❌ Не удалось получить суммаризацию. Попробуй позже.")
 
 
 # ─── /summary — главное меню ─────────────────────────────────────────────────
@@ -289,7 +321,6 @@ async def mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── ConversationHandler: ввод количества ────────────────────────────────────
 async def got_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    await update.message.delete()
 
     if not text.isdigit() or not (1 <= int(text) <= 1000):
         await update.message.reply_text("⚠️ Введи число от 1 до 1000:")
@@ -316,7 +347,6 @@ async def got_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── ConversationHandler: ввод часов ─────────────────────────────────────────
 async def got_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip().replace(",", ".")
-    await update.message.delete()
 
     try:
         hours = float(text)
@@ -357,11 +387,14 @@ async def style_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     filter_parts = context.user_data.get("sum_filter_parts", [])
 
     async def send_fn(text): await context.bot.send_message(chat_id=chat_id, text=text)
+    async def edit_fn(text):
+        try: await query.edit_message_text(text)
+        except: pass
     async def delete_fn():
         try: await query.delete_message()
         except: pass
 
-    await do_summary(chat_id, style, count, since, filter_parts, send_fn, delete_fn)
+    await do_summary(chat_id, style, count, since, filter_parts, send_fn, edit_fn, delete_fn)
     return ConversationHandler.END
 
 
@@ -382,11 +415,14 @@ async def summary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filter_parts.append("за последние 2ч")
 
     async def send_fn(text): await context.bot.send_message(chat_id=chat_id, text=text)
+    async def edit_fn(text):
+        try: await query.edit_message_text(text)
+        except: pass
     async def delete_fn():
         try: await query.delete_message()
         except: pass
 
-    await do_summary(chat_id, style, int(count_str), since, filter_parts, send_fn, delete_fn)
+    await do_summary(chat_id, style, int(count_str), since, filter_parts, send_fn, edit_fn, delete_fn)
 
 
 # ─── /start ───────────────────────────────────────────────────────────────────
