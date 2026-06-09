@@ -23,7 +23,7 @@ logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ["OPENROUTER_API_KEY"])
-MODEL = "openai/gpt-oss-120b:free"
+MODEL = "deepseek/deepseek-v4-flash"
 BOT_USERNAME = "netrys_bot"
 
 MAX_MESSAGES = 1000
