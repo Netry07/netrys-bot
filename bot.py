@@ -7,6 +7,7 @@ from collections import defaultdict
 from dotenv import load_dotenv
 from openai import OpenAI
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import wheel
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -432,7 +433,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Слежу за сообщениями и кратко пересказываю их по запросу.\n\n"
         "📌 Команды:\n"
         "  /summary — открыть меню резюме\n"
-        "  /count — сколько сообщений запомнено\n"
+        "  /count — сколько сообщений запомнено\n\n"
+        "🎡 Колесо удачи:\n"
+        "  /wheel — меню колеса\n"
+        "  /spin [колесо] — крутить\n"
+        "  /tierlist — тир-лист и шансы\n"
+        "  /addgame — добавить пункт или список\n"
+        "  /setweights — коэффициенты тиров\n"
+        "  /wheels, /newwheel — свои колёса\n"
+        "  /wheelstats, /newevening — статистика, новый вечер\n"
     )
     await update.message.reply_text(text)
 
@@ -452,6 +461,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 def main():
     init_db()
+    wheel.init_tables(DB_PATH)
     app = ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
 
     # ConversationHandler для ввода числа/часов
@@ -471,6 +481,7 @@ def main():
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("count", count_cmd))
     app.add_handler(conv)
+    wheel.register(app)  # колесо удачи — до общего обработчика текста
     app.add_handler(CallbackQueryHandler(summary_callback, pattern="^sum\\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, store_message))
 
