@@ -5,7 +5,9 @@
 • у каждого колеса свои тиры и свои коэффициенты (вес = относительный шанс пункта)
 • пункты добавляются по одному или списком, переносятся между тирами, удаляются
 • колесо рисуется на лету (Pillow) и уходит в чат GIF-анимацией
-• выпавшие пункты не повторяются до «нового вечера», есть статистика
+• у каждого тира лимит выпадений за вечер; после каждого выпадения шанс пункта падает на n п.п.
+  от исходного, при исчерпании лимита пункт выходит из колеса до «нового вечера»
+• есть статистика и её очистка (отдельно по каждому колесу)
 • «Крутить заново» — по голосованию (в группе нужно REROLL_VOTES голосов)
 
 Подключение в bot.py:
@@ -44,8 +46,8 @@ logger = logging.getLogger(__name__)
 
 # ─── Настройки ────────────────────────────────────────────────────────────────
 JACKBOX_NAME = "Jackbox"
-# стартовые тиры Jackbox: (название, коэффициент); меняются потом через /setweights
-JACKBOX_TIERS = [("GOAT", 16), ("Peak", 8), ("Mid", 4), ("Meh", 2), ("Slop", 1)]
+# стартовые тиры Jackbox: (название, коэффициент, лимит выпадений за вечер); меняются через /setweights
+JACKBOX_TIERS = [("GOAT", 16, 5), ("Peak", 8, 4), ("Mid", 4, 3), ("Meh", 2, 2), ("Slop", 1, 1)]
 # тир-лист друзей (цвета в таблице сверху вниз: GOAT → Slop)
 JACKBOX_GAMES = {
     "GOAT": ["Бредовуха: Мы всё про вас знаем", "Хламотопия"],
@@ -58,7 +60,9 @@ JACKBOX_GAMES = {
             "Преступление и рисование"],
     "Slop": ["Словариум", "Купол Зипол"],
 }
-DEFAULT_TIER = ("Обычный", 1)      # единственный тир у нового колеса
+DEFAULT_TIER = ("Обычный", 1, 1)   # единственный тир у нового колеса: (название, коэф., лимит)
+DEFAULT_DECAY = 20                 # на сколько п.п. от исходного шанса падает пункт после выпадения
+KNOWN_LIMITS = {"goat": 5, "peak": 4, "mid": 3, "meh": 2, "slop": 1}   # для миграции старых баз
 
 MAX_WHEELS = 10
 MAX_TIERS = 10
@@ -66,6 +70,7 @@ MAX_ITEMS = 300
 MAX_NAME_LEN = 40
 MAX_TIER_NAME = 20
 MAX_WEIGHT = 1000
+MAX_LIMIT = 100
 REROLL_VOTES = 2          # голосов для «Крутить заново» в группе
 PAGE_SIZE = 10
 
@@ -87,7 +92,7 @@ FRAME_MS = 80
 HOLD_MS = 2500
 SPIN_SECONDS = FRAMES * FRAME_MS / 1000 + 1.0
 
-ADD_TEXT, ADD_TIER, WTS_TEXT, NEW_NAME = range(4)
+ADD_TEXT, ADD_TIER, WTS_TEXT, NEW_NAME, DECAY_TEXT = range(5)
 
 _db_path = "messages.db"
 _spin_locks: dict[int, asyncio.Lock] = {}
@@ -110,6 +115,7 @@ def init_tables(db_path: str):
                 chat_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 name_key TEXT NOT NULL,
+                decay REAL NOT NULL DEFAULT 20,
                 UNIQUE(chat_id, name_key)
             );
             CREATE TABLE IF NOT EXISTS wh_tiers (
@@ -119,6 +125,7 @@ def init_tables(db_path: str):
                 name_key TEXT NOT NULL,
                 weight REAL NOT NULL,
                 pos INTEGER NOT NULL,
+                max_plays INTEGER NOT NULL DEFAULT 1,
                 UNIQUE(wheel_id, name_key)
             );
             CREATE TABLE IF NOT EXISTS wh_items (
@@ -127,7 +134,7 @@ def init_tables(db_path: str):
                 name TEXT NOT NULL,
                 name_key TEXT NOT NULL,
                 tier_id INTEGER NOT NULL REFERENCES wh_tiers(id),
-                played INTEGER NOT NULL DEFAULT 0,
+                plays INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(wheel_id, name_key)
             );
             CREATE TABLE IF NOT EXISTS wh_spins (
@@ -147,17 +154,39 @@ def init_tables(db_path: str):
                 active_wheel_id INTEGER
             );
         """)
+        _migrate(c)
         c.commit()
 
 
+def _columns(c, table: str) -> set:
+    return {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate(c):
+    """Старые базы: добавляем спад шанса и лимиты тиров, played -> plays."""
+    if "decay" not in _columns(c, "wh_wheels"):
+        c.execute(f"ALTER TABLE wh_wheels ADD COLUMN decay REAL NOT NULL DEFAULT {DEFAULT_DECAY}")
+    if "max_plays" not in _columns(c, "wh_tiers"):
+        c.execute("ALTER TABLE wh_tiers ADD COLUMN max_plays INTEGER NOT NULL DEFAULT 1")
+        for key, lim in KNOWN_LIMITS.items():
+            c.execute("UPDATE wh_tiers SET max_plays = ? WHERE name_key = ? "
+                      "AND wheel_id IN (SELECT id FROM wh_wheels WHERE name_key = ?)",
+                      (lim, key, JACKBOX_NAME.casefold()))
+    cols = _columns(c, "wh_items")
+    if "plays" not in cols:
+        c.execute("ALTER TABLE wh_items ADD COLUMN plays INTEGER NOT NULL DEFAULT 0")
+        if "played" in cols:
+            c.execute("UPDATE wh_items SET plays = played")
+
+
 # ─── колёса ───
-def _new_wheel(c, chat_id: int, name: str, tiers: list[tuple[str, float]]):
+def _new_wheel(c, chat_id: int, name: str, tiers: list[tuple[str, float, int]]):
     cur = c.execute("INSERT INTO wh_wheels (chat_id, name, name_key) VALUES (?, ?, ?)",
                     (chat_id, name, name.casefold()))
     wid = cur.lastrowid
-    for pos, (tname, w) in enumerate(tiers):
-        c.execute("INSERT INTO wh_tiers (wheel_id, name, name_key, weight, pos) VALUES (?, ?, ?, ?, ?)",
-                  (wid, tname, tname.casefold(), w, pos))
+    for pos, (tname, w, lim) in enumerate(tiers):
+        c.execute("INSERT INTO wh_tiers (wheel_id, name, name_key, weight, pos, max_plays) VALUES (?, ?, ?, ?, ?, ?)",
+                  (wid, tname, tname.casefold(), w, pos, lim))
     return wid
 
 
@@ -187,9 +216,15 @@ def wheels_list(chat_id: int) -> list[dict]:
 
 def wheel_get(chat_id: int, wheel_id: int):
     with closing(_conn()) as c:
-        r = c.execute("SELECT id, name FROM wh_wheels WHERE id = ? AND chat_id = ?",
+        r = c.execute("SELECT id, name, decay FROM wh_wheels WHERE id = ? AND chat_id = ?",
                       (wheel_id, chat_id)).fetchone()
-    return {"id": r[0], "name": r[1]} if r else None
+    return {"id": r[0], "name": r[1], "decay": r[2]} if r else None
+
+
+def set_decay(chat_id: int, wheel_id: int, decay: float):
+    with closing(_conn()) as c:
+        c.execute("UPDATE wh_wheels SET decay = ? WHERE id = ? AND chat_id = ?", (decay, wheel_id, chat_id))
+        c.commit()
 
 
 def wheel_find(chat_id: int, text: str):
@@ -260,21 +295,22 @@ def tier_style(name: str, pos: int):
 def tiers_get(wheel_id: int) -> list[dict]:
     with closing(_conn()) as c:
         rows = c.execute(
-            "SELECT t.id, t.name, t.weight, t.pos, (SELECT COUNT(*) FROM wh_items i WHERE i.tier_id = t.id) "
-            "FROM wh_tiers t WHERE t.wheel_id = ? ORDER BY t.pos, t.id", (wheel_id,)).fetchall()
+            "SELECT t.id, t.name, t.weight, t.pos, (SELECT COUNT(*) FROM wh_items i WHERE i.tier_id = t.id), "
+            "t.max_plays FROM wh_tiers t WHERE t.wheel_id = ? ORDER BY t.pos, t.id", (wheel_id,)).fetchall()
     out = []
     for r in rows:
         rgb, emoji = tier_style(r[1], r[3])
         out.append({"id": r[0], "name": r[1], "weight": r[2], "pos": r[3], "count": r[4],
-                    "rgb": rgb, "emoji": emoji})
+                    "limit": r[5], "rgb": rgb, "emoji": emoji})
     return out
 
 
-def tiers_apply(wheel_id: int, spec: list[tuple[str, float]]):
+def tiers_apply(wheel_id: int, spec: list[tuple[str, float, int | None]]):
     """Заменяет набор тиров. Существующие (по названию) обновляются, лишние удаляются,
-    только если в них нет пунктов. -> текст ошибки | None"""
+    только если в них нет пунктов. Лимит None: у существующего тира остаётся прежний, у нового = 1.
+    -> текст ошибки | None"""
     cur_tiers = {t["name"].casefold(): t for t in tiers_get(wheel_id)}
-    new_keys = {n.casefold() for n, _ in spec}
+    new_keys = {n.casefold() for n, *_ in spec}
     blocked = [t["name"] for k, t in cur_tiers.items() if k not in new_keys and t["count"] > 0]
     if blocked:
         return ("Нельзя убрать тиры, в которых есть пункты: " + ", ".join(blocked) +
@@ -283,26 +319,38 @@ def tiers_apply(wheel_id: int, spec: list[tuple[str, float]]):
         for k, t in cur_tiers.items():
             if k not in new_keys:
                 c.execute("DELETE FROM wh_tiers WHERE id = ?", (t["id"],))
-        for pos, (name, w) in enumerate(spec):
+        for pos, (name, w, lim) in enumerate(spec):
             t = cur_tiers.get(name.casefold())
             if t:
-                c.execute("UPDATE wh_tiers SET weight = ?, pos = ? WHERE id = ?", (w, pos, t["id"]))
+                c.execute("UPDATE wh_tiers SET weight = ?, pos = ?, max_plays = ? WHERE id = ?",
+                          (w, pos, lim if lim is not None else t["limit"], t["id"]))
             else:
-                c.execute("INSERT INTO wh_tiers (wheel_id, name, name_key, weight, pos) VALUES (?, ?, ?, ?, ?)",
-                          (wheel_id, name, name.casefold(), w, pos))
+                c.execute("INSERT INTO wh_tiers (wheel_id, name, name_key, weight, pos, max_plays) "
+                          "VALUES (?, ?, ?, ?, ?, ?)",
+                          (wheel_id, name, name.casefold(), w, pos, lim if lim is not None else 1))
         c.commit()
     return None
 
 
 # ─── пункты ───
+def eff_weight(base: float, plays: int, decay: float) -> float:
+    """Текущий вес: исходный минус decay п.п. от исходного за каждое выпадение, не ниже 0."""
+    mult = 1.0 - decay * plays / 100.0
+    return base * mult if mult > 1e-9 else 0.0
+
+
 def _item_row(r):
     rgb, emoji = tier_style(r[3], r[5])
+    plays, limit, decay = r[6], r[8], r[9]
+    eff = 0.0 if plays >= limit else eff_weight(r[4], plays, decay)
     return {"id": r[0], "name": r[1], "tier_id": r[2], "tier": r[3], "weight": r[4],
-            "pos": r[5], "played": bool(r[6]), "rgb": rgb, "emoji": emoji, "wheel_id": r[7]}
+            "pos": r[5], "plays": plays, "limit": limit, "eff": eff, "available": eff > 0,
+            "rgb": rgb, "emoji": emoji, "wheel_id": r[7]}
 
 
-_ITEM_SELECT = ("SELECT i.id, i.name, i.tier_id, t.name, t.weight, t.pos, i.played, i.wheel_id "
-                "FROM wh_items i JOIN wh_tiers t ON t.id = i.tier_id ")
+_ITEM_SELECT = ("SELECT i.id, i.name, i.tier_id, t.name, t.weight, t.pos, i.plays, i.wheel_id, "
+                "t.max_plays, w.decay "
+                "FROM wh_items i JOIN wh_tiers t ON t.id = i.tier_id JOIN wh_wheels w ON w.id = i.wheel_id ")
 
 
 def items_all(wheel_id: int) -> list[dict]:
@@ -315,7 +363,7 @@ def items_all(wheel_id: int) -> list[dict]:
 
 def item_get(chat_id: int, item_id: int):
     with closing(_conn()) as c:
-        r = c.execute(_ITEM_SELECT + "JOIN wh_wheels w ON w.id = i.wheel_id WHERE i.id = ? AND w.chat_id = ?",
+        r = c.execute(_ITEM_SELECT + "WHERE i.id = ? AND w.chat_id = ?",
                       (item_id, chat_id)).fetchone()
     return _item_row(r) if r else None
 
@@ -352,15 +400,22 @@ def item_delete(chat_id: int, item_id: int):
         c.commit()
 
 
-def set_played(item_id: int, played: bool):
+def inc_plays(item_id: int):
     with closing(_conn()) as c:
-        c.execute("UPDATE wh_items SET played = ? WHERE id = ?", (1 if played else 0, item_id))
+        c.execute("UPDATE wh_items SET plays = plays + 1 WHERE id = ?", (item_id,))
+        c.commit()
+
+
+def dec_plays(item_id: int):
+    with closing(_conn()) as c:
+        c.execute("UPDATE wh_items SET plays = MAX(0, plays - 1) WHERE id = ?", (item_id,))
         c.commit()
 
 
 def reset_played(wheel_id: int):
+    """«Новый вечер»: все счётчики выпадений в ноль, шансы возвращаются к исходным."""
     with closing(_conn()) as c:
-        c.execute("UPDATE wh_items SET played = 0 WHERE wheel_id = ?", (wheel_id,))
+        c.execute("UPDATE wh_items SET plays = 0 WHERE wheel_id = ?", (wheel_id,))
         c.commit()
 
 
@@ -396,6 +451,20 @@ def spin_reject(chat_id: int, spin_id: int):
         c.commit()
 
 
+def spins_count(chat_id: int, wheel_id: int) -> int:
+    with closing(_conn()) as c:
+        return c.execute("SELECT COUNT(*) FROM wh_spins WHERE chat_id = ? AND wheel_id = ? AND rejected = 0",
+                         (chat_id, wheel_id)).fetchone()[0]
+
+
+def stats_clear(chat_id: int, wheel_id: int) -> int:
+    """Удаляет историю выпадений колеса (и, как следствие, топ). Счётчики выпадений пунктов не трогает."""
+    with closing(_conn()) as c:
+        cur = c.execute("DELETE FROM wh_spins WHERE chat_id = ? AND wheel_id = ?", (chat_id, wheel_id))
+        c.commit()
+        return cur.rowcount
+
+
 def stats_data(chat_id: int, wheel_id: int):
     with closing(_conn()) as c:
         total = c.execute("SELECT COUNT(*) FROM wh_spins WHERE chat_id = ? AND wheel_id = ? AND rejected = 0",
@@ -429,11 +498,11 @@ def clean_name(raw: str, limit: int = MAX_NAME_LEN):
 
 
 _BULLET = re.compile(r"^\s*(?:[-•*–—]+|\d+[.)])\s+")
-_WEIGHT_RE = re.compile(r"^(.+?)\s*[=:]\s*(\d+(?:[.,]\d+)?)$")
+_WEIGHT_RE = re.compile(r"^(.+?)\s*[=:]\s*(\d+(?:[.,]\d+)?)(?:\s*/\s*(\d+))?$")
 
 
 def parse_weights(text: str):
-    """«GOAT=16, Peak=8» / по строке на тир -> (spec, ошибка)"""
+    """«GOAT=16/5, Peak=8/4» (коэффициент/лимит за вечер) / по строке на тир -> (spec, ошибка)"""
     parts = [p.strip() for p in re.split(r"\n|;|,\s+", text) if p.strip()]
     if not parts:
         return None, "Пустой ввод."
@@ -443,7 +512,7 @@ def parse_weights(text: str):
     for p in parts:
         m = _WEIGHT_RE.match(p)
         if not m:
-            return None, (f"Не понял «{p}». Формат: Название=число. "
+            return None, (f"Не понял «{p}». Формат: Название=коэффициент/лимит (лимит можно не указывать). "
                           "Разделяй тиры переносом строки или «, » (запятая + пробел).")
         name, err = clean_name(m.group(1), MAX_TIER_NAME)
         if err or "|" in name:
@@ -451,10 +520,13 @@ def parse_weights(text: str):
         w = float(m.group(2).replace(",", "."))
         if not (0 < w <= MAX_WEIGHT):
             return None, f"Коэффициент для «{name}» должен быть больше 0 и не больше {MAX_WEIGHT}."
+        lim = int(m.group(3)) if m.group(3) else None
+        if lim is not None and not (1 <= lim <= MAX_LIMIT):
+            return None, f"Лимит для «{name}» должен быть от 1 до {MAX_LIMIT}."
         if name.casefold() in seen:
             return None, f"Тир «{name}» указан дважды."
         seen.add(name.casefold())
-        spec.append((name, w))
+        spec.append((name, w, lim))
     return spec, None
 
 
@@ -560,11 +632,11 @@ def _sector_color(index: int, rgb):
 
 
 def _layout(pool: list[dict]):
-    total = sum(g["weight"] for g in pool)
+    total = sum(g["eff"] for g in pool)
     a = -90.0  # у PIL 0° — «3 часа», по часовой; начинаем сверху
     sectors = []
     for g in pool:
-        sweep = 360.0 * g["weight"] / total
+        sweep = 360.0 * g["eff"] / total
         sectors.append({"item": g, "a0": a, "a1": a + sweep, "sweep": sweep})
         a += sweep
     return sectors
@@ -656,9 +728,10 @@ def render_wheel_gif(pool: list[dict], winner_idx: int) -> bytes:
 # ═══ Тексты и клавиатуры ══════════════════════════════════════════════════════
 def menu_text(wheel: dict) -> str:
     items = items_all(wheel["id"])
-    left = sum(1 for g in items if not g["played"])
+    left = sum(1 for g in items if g["available"])
     return (f"🎡 <b>{esc(wheel['name'])}</b>\n"
-            f"Пунктов: {len(items)}, ещё не выпадали в этот вечер: {left}")
+            f"Пунктов: {len(items)}, сейчас в игре: {left}\n"
+            f"Спад шанса за выпадение: {fmt_w(wheel['decay'])} п.п.")
 
 
 def menu_markup() -> InlineKeyboardMarkup:
@@ -669,8 +742,9 @@ def menu_markup() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("➕ Добавить", callback_data="wh|add"),
          InlineKeyboardButton("✏️ Управление", callback_data="wh|mng|0")],
         [InlineKeyboardButton("⚖️ Коэффициенты", callback_data="wh|wts"),
-         InlineKeyboardButton("🔀 Колёса", callback_data="wh|ws")],
-        [InlineKeyboardButton("♻️ Новый вечер", callback_data="wh|reset")],
+         InlineKeyboardButton("📉 Спад шанса", callback_data="wh|decayedit")],
+        [InlineKeyboardButton("🔀 Колёса", callback_data="wh|ws"),
+         InlineKeyboardButton("♻️ Новый вечер", callback_data="wh|reset")],
     ])
 
 
@@ -680,16 +754,23 @@ def tierlist_chunks(wheel: dict) -> list[str]:
     if not items:
         return [f"В колесе «{esc(wheel['name'])}» пока пусто. Добавь пункты: /addgame"]
     total = sum(g["weight"] for g in items)
+    total_now = sum(g["eff"] for g in items)
     lines = [f"<b>🎡 {esc(wheel['name'])}</b>"]
     for t in tiers:
         gs = [g for g in items if g["tier_id"] == t["id"]]
         if not gs:
             continue
-        lines.append(f"\n{t['emoji']} <b>{esc(t['name'])}</b> (коэф. {fmt_w(t['weight'])}) — "
+        lines.append(f"\n{t['emoji']} <b>{esc(t['name'])}</b> (коэф. {fmt_w(t['weight'])}, лимит {t['limit']}) — "
                      f"по {100 * t['weight'] / total:.1f}% на пункт")
         for g in gs:
-            lines.append(f"• {esc(g['name'])}" + (" <i>(уже выпадал)</i>" if g["played"] else ""))
-    lines.append("\n<i>Шансы указаны для полного колеса.</i>")
+            if not g["plays"]:
+                note = ""
+            elif g["available"]:
+                note = f" <i>(выпадал {g['plays']}/{g['limit']}, сейчас {100 * g['eff'] / total_now:.1f}%)</i>"
+            else:
+                note = f" <i>(выпадал {g['plays']}/{g['limit']}, до нового вечера не выпадет)</i>"
+            lines.append(f"• {esc(g['name'])}{note}")
+    lines.append("\n<i>Проценты у тиров — для полного колеса в начале вечера.</i>")
     chunks, cur = [], ""
     for ln in lines:
         if len(cur) + len(ln) + 1 > 3800:
@@ -704,17 +785,23 @@ def weights_text(wheel: dict) -> str:
     tiers = tiers_get(wheel["id"])
     lines = [f"⚖️ <b>Коэффициенты колеса «{esc(wheel['name'])}»</b>", ""]
     for t in tiers:
-        lines.append(f"{t['emoji']} {esc(t['name'])} = <b>{fmt_w(t['weight'])}</b> ({t['count']} шт.)")
+        lines.append(f"{t['emoji']} {esc(t['name'])} = <b>{fmt_w(t['weight'])}</b>, "
+                     f"лимит за вечер: <b>{t['limit']}</b> ({t['count']} шт.)")
+    lines.append(f"\n📉 Спад шанса: <b>{fmt_w(wheel['decay'])}</b> п.п. от исходного за каждое выпадение")
     lines.append("\nЧем больше коэффициент, тем чаще выпадают пункты тира. "
-                 "Шанс пункта = коэффициент его тира / сумма коэффициентов всех пунктов на колесе.")
+                 "Шанс пункта = его текущий вес / сумма текущих весов всех пунктов на колесе. "
+                 "Текущий вес = коэффициент × (1 − спад × число выпадений / 100), но не ниже 0. "
+                 "Когда пункт выпал столько раз, сколько позволяет лимит тира, он выходит из колеса "
+                 "до «Нового вечера».")
     return "\n".join(lines)
 
 
 def weights_prompt(wheel: dict) -> str:
-    cur = ", ".join(f"{t['name']}={fmt_w(t['weight'])}" for t in tiers_get(wheel["id"]))
+    cur = ", ".join(f"{t['name']}={fmt_w(t['weight'])}/{t['limit']}" for t in tiers_get(wheel["id"]))
     return (weights_text(wheel) + "\n\n✏️ Пришли новый набор тиров по порядку (от лучшего к худшему), "
-            "по одному на строке или через «, »:\n"
+            "по одному на строке или через «, ». Формат: <code>Название=коэффициент/лимит</code>:\n"
             f"<code>{esc(cur)}</code>\n"
+            "Лимит можно не указывать: у существующего тира он останется прежним, у нового будет 1. "
             "Новые тиры создадутся, существующие обновятся, пустые лишние удалятся. Отмена — /cancel.")
 
 
@@ -733,6 +820,27 @@ def stats_text(wheel: dict) -> str:
             when = ts
         lines.append(f"• {when} — {esc(name)} ({esc(user)})")
     return "\n".join(lines)
+
+
+def stats_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🧹 Очистить статистику", callback_data="wh|csl")]])
+
+
+def clear_picker_view(chat_id: int):
+    rows = [[InlineKeyboardButton(f"{w['name']} ({spins_count(chat_id, w['id'])})"[:40],
+                                  callback_data=f"wh|cs|{w['id']}")] for w in wheels_list(chat_id)]
+    rows.append([InlineKeyboardButton("⬅️ Меню", callback_data="wh|menu")])
+    return ("🧹 <b>Статистику какого колеса очистить?</b>\nВ скобках — число записанных результатов.",
+            InlineKeyboardMarkup(rows))
+
+
+def clear_confirm_view(chat_id: int, target: dict):
+    n = spins_count(chat_id, target["id"])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🧹 Да, очистить", callback_data=f"wh|csyes|{target['id']}"),
+                                InlineKeyboardButton("Отмена", callback_data="wh|csl")]])
+    return (f"Очистить статистику колеса «{esc(target['name'])}»? Будет удалена вся история выпадений "
+            f"({n} шт.) и топ. Текущие шансы и лимиты пунктов не изменятся: они сбрасываются "
+            "кнопкой «Новый вечер».", kb)
 
 
 def wheels_view(chat_id: int):
@@ -776,12 +884,12 @@ async def run_spin(bot, chat_id: int, wheel_id: int, user_name: str, private: bo
             await bot.send_message(chat_id, f"В колесе «{wheel['name']}» пока нет пунктов. Добавь: /addgame")
             return
         note = ""
-        pool = [g for g in everything if not g["played"]]
+        pool = [g for g in everything if g["available"]]
         if not pool:
             reset_played(wheel_id)
             pool = items_all(wheel_id)
-            note = "♻️ Все пункты уже выпадали — начинаем новый круг!\n\n"
-        weights = [g["weight"] for g in pool]
+            note = "♻️ У всех пунктов исчерпан лимит — начинаем новый круг!\n\n"
+        weights = [g["eff"] for g in pool]
         winner_idx = random.choices(range(len(pool)), weights=weights)[0]
         winner = pool[winner_idx]
         pct = 100.0 * weights[winner_idx] / sum(weights)
@@ -791,13 +899,20 @@ async def run_spin(bot, chat_id: int, wheel_id: int, user_name: str, private: bo
         await asyncio.sleep(SPIN_SECONDS)
 
         spin_id = spin_add(chat_id, wheel_id, winner, user_name)
-        set_played(winner["id"], True)
+        inc_plays(winner["id"])
+        plays = winner["plays"] + 1
+        if plays >= winner["limit"] or eff_weight(winner["weight"], plays, wheel["decay"]) <= 0:
+            nxt = "лимит исчерпан, до нового вечера не выпадет"
+        else:
+            nxt = f"шанс теперь {100 * eff_weight(1.0, plays, wheel['decay']):.0f}% от исходного"
+        left = sum(1 for g in items_all(wheel_id) if g["available"])
         need = 1 if private else REROLL_VOTES
         text = (f"{note}🎡 <b>{esc(wheel['name'])}</b> — выпало:\n"
                 f"{winner['emoji']} <b>{esc(winner['name'])}</b>\n"
                 f"Тир: {esc(winner['tier'])} · шанс был {pct:.1f}%\n"
+                f"Выпадал за вечер: {plays}/{winner['limit']} — {nxt}\n"
                 f"Крутил(а): {esc(user_name)}\n\n"
-                f"<i>Ещё не выпадали в этот вечер: {len(pool) - 1}</i>")
+                f"<i>Пунктов ещё в игре: {left}</i>")
         await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
                                reply_markup=result_markup(spin_id, 0, need))
 
@@ -839,13 +954,13 @@ async def cmd_tierlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     w = active_wheel(update.effective_chat.id)
     w["chat_id"] = update.effective_chat.id
-    await update.message.reply_text(stats_text(w), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(stats_text(w), parse_mode=ParseMode.HTML, reply_markup=stats_markup())
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     w = active_wheel(update.effective_chat.id)
     reset_played(w["id"])
-    await update.message.reply_text(f"♻️ Новый вечер! Все пункты колеса «{w['name']}» снова в игре.")
+    await update.message.reply_text(f"♻️ Новый вечер! Все пункты колеса «{w['name']}» снова в игре, шансы вернулись к исходным.")
 
 
 async def cmd_wheels(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -857,7 +972,23 @@ async def cmd_weights(update: Update, context: ContextTypes.DEFAULT_TYPE):
     w = active_wheel(update.effective_chat.id)
     await update.message.reply_text(weights_text(w), parse_mode=ParseMode.HTML,
                                     reply_markup=InlineKeyboardMarkup([[
-                                        InlineKeyboardButton("✏️ Изменить", callback_data="wh|wtsedit")]]))
+                                        InlineKeyboardButton("✏️ Изменить", callback_data="wh|wtsedit"),
+                                        InlineKeyboardButton("📉 Спад шанса", callback_data="wh|decayedit")]]))
+
+
+async def cmd_clearstats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    active_wheel(chat_id)
+    arg = _cmd_text(update)
+    if arg:
+        target = wheel_find(chat_id, arg)
+        if not target:
+            await update.message.reply_text("Не нашёл такое колесо. Список: /wheels")
+            return
+        text, kb = clear_confirm_view(chat_id, target)
+    else:
+        text, kb = clear_picker_view(chat_id)
+    await update.message.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 # ═══ Диалоги: добавление пунктов / коэффициенты / новое колесо ════════════════
@@ -974,6 +1105,60 @@ async def _apply_weights(message, context, text: str, wheel: dict):
     return ConversationHandler.END
 
 
+def parse_decay(text: str):
+    """«20» / «20%» -> (n, ошибка)"""
+    try:
+        n = float(text.strip().rstrip("%").strip().replace(",", "."))
+    except ValueError:
+        return None, "Нужно число от 0 до 100, например 20."
+    if not (0 <= n <= 100):
+        return None, "Спад должен быть от 0 до 100 процентных пунктов."
+    return n, None
+
+
+def decay_prompt(wheel: dict) -> str:
+    return (f"📉 Спад шанса на колесе «{esc(wheel['name'])}» сейчас: <b>{fmt_w(wheel['decay'])}</b> п.п. за выпадение.\n"
+            "Пришли новое число от 0 до 100 — на столько процентных пунктов от исходного шанса пункт "
+            "теряет после каждого выпадения (при 20: 100% → 80% → 60% …, ниже 0 не опускается). "
+            "0 — шанс не меняется, работает только лимит тира. Отмена — /cancel.")
+
+
+async def _apply_decay(message, context, text: str, wheel: dict):
+    n, err = parse_decay(text)
+    if err:
+        await message.reply_text(f"⚠️ {err}\nПопробуй ещё раз или /cancel.")
+        return DECAY_TEXT
+    set_decay(message.chat_id, wheel["id"], n)
+    w = wheel_get(message.chat_id, wheel["id"])
+    await message.reply_text("✅ Готово!\n\n" + weights_text(w), parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
+
+
+async def decay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    w = active_wheel(update.effective_chat.id)
+    context.user_data["wh_target"] = w["id"]
+    text = _cmd_text(update)
+    if text:
+        return await _apply_decay(update.message, context, text, w)
+    await update.message.reply_text(decay_prompt(w), parse_mode=ParseMode.HTML)
+    return DECAY_TEXT
+
+
+async def decay_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    w = active_wheel(query.message.chat_id)
+    context.user_data["wh_target"] = w["id"]
+    await context.bot.send_message(query.message.chat_id, decay_prompt(w), parse_mode=ParseMode.HTML)
+    return DECAY_TEXT
+
+
+async def decay_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    w = wheel_get(chat_id, context.user_data.get("wh_target", 0)) or active_wheel(chat_id)
+    return await _apply_decay(update.message, context, update.message.text or "", w)
+
+
 async def _create_wheel_reply(message, chat_id: int, raw: str):
     name, err = clean_name(raw, 30)
     if err:
@@ -1057,7 +1242,8 @@ def _item_card(item: dict, page: int):
     total = sum(g["weight"] for g in items_all(item["wheel_id"]))
     text = (f"<b>{esc(item['name'])}</b>\n"
             f"Тир: {item['emoji']} {esc(item['tier'])} (коэф. {fmt_w(item['weight'])}) · "
-            f"шанс {100 * item['weight'] / total:.1f}%\n\nПеренести в другой тир:")
+            f"шанс {100 * item['weight'] / total:.1f}% в начале вечера\n"
+            f"Выпадал за вечер: {item['plays']}/{item['limit']}\n\nПеренести в другой тир:")
     rows = _tier_rows("wh|mv", tiers, item["tier_id"], extra="")
     # в callback нужен id пункта и страница: wh|mv|<item>|<tier>|<page>
     rows = [[InlineKeyboardButton(b.text, callback_data=f"wh|mv|{item['id']}|{b.callback_data.split('|')[2]}|{page}")
@@ -1091,15 +1277,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id, chunk, parse_mode=ParseMode.HTML)
 
     elif action == "stats":
-        await context.bot.send_message(chat_id, stats_text(w), parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id, stats_text(w), parse_mode=ParseMode.HTML,
+                                       reply_markup=stats_markup())
 
     elif action == "reset":
         reset_played(w["id"])
-        await _safe_edit(query, menu_text(w) + "\n\n♻️ Новый вечер! Все пункты снова в игре.", menu_markup())
+        await _safe_edit(query, menu_text(w) + "\n\n♻️ Новый вечер! Все пункты снова в игре, шансы исходные.", menu_markup())
 
     elif action == "wts":
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("✏️ Изменить", callback_data="wh|wtsedit"),
-                                    InlineKeyboardButton("⬅️ Меню", callback_data="wh|menu")]])
+                                    InlineKeyboardButton("📉 Спад шанса", callback_data="wh|decayedit")],
+                                   [InlineKeyboardButton("⬅️ Меню", callback_data="wh|menu")]])
         await _safe_edit(query, weights_text(w), kb)
 
     elif action == "mng":
@@ -1158,6 +1346,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             wheel_delete(chat_id, int(parts[2]))
         await _safe_edit(query, *wheels_view(chat_id))
 
+    elif action == "csl":
+        await _safe_edit(query, *clear_picker_view(chat_id))
+
+    elif action == "cs":
+        target = wheel_get(chat_id, int(parts[2]))
+        await _safe_edit(query, *(clear_confirm_view(chat_id, target) if target else clear_picker_view(chat_id)))
+
+    elif action == "csyes":
+        target = wheel_get(chat_id, int(parts[2]))
+        if target:
+            n = stats_clear(chat_id, target["id"])
+            await _safe_edit(query,
+                             f"🧹 Статистика колеса «{esc(target['name'])}» очищена (записей: {n}). "
+                             "Шансы и лимиты пунктов не тронуты.",
+                             InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Меню", callback_data="wh|menu")]]))
+        else:
+            await _safe_edit(query, *clear_picker_view(chat_id))
+
     elif action == "ok":
         spin = spin_get(chat_id, int(parts[2]))
         if spin and not spin["rejected"]:
@@ -1189,7 +1395,7 @@ async def _handle_reroll(query, context, chat_id: int, spin_id: int, private: bo
         votes.pop((chat_id, spin_id), None)
         spin_reject(chat_id, spin_id)
         if spin["item_id"]:
-            set_played(spin["item_id"], False)
+            dec_plays(spin["item_id"])
         await _safe_edit(query, f"❌ <s>{esc(spin['name'])}</s> — не зашло, крутим заново", None)
         context.application.create_task(
             run_spin(context.bot, chat_id, spin["wheel_id"], query.from_user.first_name or "Аноним", private))
@@ -1206,15 +1412,18 @@ def register(app):
             CommandHandler(["addgame", "addgames"], add_cmd),
             CommandHandler("setweights", wts_cmd),
             CommandHandler("newwheel", new_cmd),
+            CommandHandler("setdecay", decay_cmd),
             CallbackQueryHandler(add_entry, pattern=r"^wh\|add$"),
             CallbackQueryHandler(wts_entry, pattern=r"^wh\|wtsedit$"),
             CallbackQueryHandler(new_entry, pattern=r"^wh\|new$"),
+            CallbackQueryHandler(decay_entry, pattern=r"^wh\|decayedit$"),
         ],
         states={
             ADD_TEXT: [MessageHandler(text_filter, add_got_text)],
             ADD_TIER: [CallbackQueryHandler(add_got_tier, pattern=r"^wh\|addtier\|")],
             WTS_TEXT: [MessageHandler(text_filter, wts_got_text)],
             NEW_NAME: [MessageHandler(text_filter, new_got_name)],
+            DECAY_TEXT: [MessageHandler(text_filter, decay_got_text)],
         },
         fallbacks=[
             CommandHandler("cancel", dialog_cancel),
@@ -1229,6 +1438,7 @@ def register(app):
     app.add_handler(CommandHandler("tierlist", cmd_tierlist))
     app.add_handler(CommandHandler("wheels", cmd_wheels))
     app.add_handler(CommandHandler("weights", cmd_weights))
+    app.add_handler(CommandHandler("clearstats", cmd_clearstats))
     app.add_handler(CommandHandler("wheelstats", cmd_stats))
     app.add_handler(CommandHandler("newevening", cmd_reset))
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^wh\|"))

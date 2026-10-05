@@ -439,9 +439,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /spin [колесо] — крутить\n"
         "  /tierlist — тир-лист и шансы\n"
         "  /addgame — добавить пункт или список\n"
-        "  /setweights — коэффициенты тиров\n"
+        "  /setweights — коэффициенты и лимиты тиров\n"
+        "  /setdecay — спад шанса после выпадения\n"
         "  /wheels, /newwheel — свои колёса\n"
         "  /wheelstats, /newevening — статистика, новый вечер\n"
+        "  /clearstats — очистить статистику колеса\n"
     )
     await update.message.reply_text(text)
 
