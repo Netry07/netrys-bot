@@ -1,12 +1,19 @@
 import os
 import re
+import json
+import zlib
+import base64
+import unicodedata
 import logging
 import sqlite3
 from datetime import datetime, timedelta
-from collections import defaultdict
+from pathlib import Path
 from dotenv import load_dotenv
 from openai import OpenAI
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
+    BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeAllChatAdministrators,
+)
 import wheel
 from telegram.ext import (
     ApplicationBuilder,
@@ -29,9 +36,6 @@ BOT_USERNAME = "netrys_bot"
 
 MAX_MESSAGES = 1000
 DB_PATH = "messages.db"
-AUTO_COMMENT_EVERY = 50
-
-message_counters: dict[int, int] = defaultdict(int)
 
 # Состояния ConversationHandler
 WAITING_COUNT, WAITING_HOURS, WAITING_STYLE = range(3)
@@ -156,37 +160,82 @@ async def check_and_respond(update):
         await msg.reply_text(reply)
 
 
-# ─── Авто-комментарий ─────────────────────────────────────────────────────────
-async def maybe_auto_comment(chat_id, context):
-    message_counters[chat_id] += 1
-    if message_counters[chat_id] < AUTO_COMMENT_EVERY:
-        return
-    message_counters[chat_id] = 0
-    last = db_get(chat_id, limit=10)
-    if not last:
-        return
-    conv = "\n".join(f"{m['sender']}: {m['text']}" for m in last)
-    system = (
-        "Ты — остроумный и дерзкий телеграм-бот по имени Нетрис. "
-        "Ты наблюдаешь за чатом и иногда вставляешь короткий комментарий. "
-        "Пиши на русском языке, 1-2 предложения максимум. "
-        "Можешь быть саркастичным, смешным или провокационным. "
-        "НЕ представляйся и НЕ объясняй что ты делаешь — просто прокомментируй."
-    )
-    reply = ai(system, f"Вот последние сообщения в чате:\n\n{conv}\n\nВставь короткий комментарий.")
-    if reply:
-        await context.bot.send_message(chat_id=chat_id, text=f"💬 {reply}")
+# ─── Быстрые ответы (без обращения к модели) ────────────────────────────────
+ASSETS = Path(__file__).resolve().parent / "assets"
+EGG_RE = re.compile(r"гени[йя]\W*(?:адапт|приспособ)|(?:адапт|приспособ)\w*\W+гени|"
+                    r"geniu?s\W*(?:of\W*)?adapt|adapt\w*\W+geniu?s|"
+                    r"(?:適応|順応).*天才|天才.*(?:適応|順応)")   # пасхалка: «гений адаптации»
+
+# словарь шаблонных реакций (сжат, чтобы не раздувать файл)
+_LEX_BLOB = "Fr8xI8g9XTN/iPuAHjAYOnL/yuk0fchqa3BZMg34pxTcGjn+2Xp0F4IpGPz6sPiqnn/V2nTDjmDDPz//FQoSBQ8EgbzeI52XwJOIq5Tw2NPpOVn6p6EKhjQIcNu4Kdb1xXWcxI0IdUTVyQ5IBGg5qJq4Vob0Hc/CKsCG3NuwDdMx3XCYtyCc0zlPmGPow+gA5mBByOsXh9WX83254Vjg0rLjpqmIhKPYwJXEt6GwIxLi8j4qOpuJpjKDgnNQPP1GasJaHe3xWbRCjWVQcDyPnvLkcIfvOLHiw0GLRvWAuUBGspVyumsm2507yqCk91MVUbKEml1XO6U5im8I5lfKTJuLy32FVAb7/bNoBuZ9IGmYOXJmruDXqzqhV76SYxdAbjyqBpbqXUMmRghw5b9bouChipPw3iu9kfrmvrUqVLIG7xzeC6GBZgpe2T/mmPOWLZsRzPhT0Nuj64+dYDQA+SmesyqHxMpCsJhhkxQrRFhKwmDX1VsTTA4HhD0DaNRLlpdYsYAolg=="
+
+
+def _load_lex() -> dict:
+    key = BOT_USERNAME.encode()
+    raw = bytes(b ^ key[i % len(key)] for i, b in enumerate(base64.b64decode(_LEX_BLOB)))
+    return json.loads(zlib.decompress(raw).decode("utf-8"))
+
+
+_LEX = _load_lex()
+
+
+def _fold(text: str) -> str:
+    t = unicodedata.normalize("NFKC", text).casefold().replace("ё", "е")
+    return re.sub(r"(.)\1+", r"\1", t)       # «победдиил» -> «победил»
+
+
+def _tokens(text: str) -> list[str]:
+    t = unicodedata.normalize("NFKC", text).casefold().replace("ё", "е")
+    t = re.sub(r"(?<=[a-zа-я])(?=[\u3040-\u30ff\u4e00-\u9fff])|(?<=[\u3040-\u30ff\u4e00-\u9fff])(?=[a-zа-я])", " ", t)
+    t = re.sub(r"[がはのも]", " ", t)
+    t = re.sub(r"[\W_]+", " ", t)
+    return re.sub(r"(.)\1+", r"\1", t).split()
+
+
+def _lex_hit(text: str) -> bool:
+    toks = _tokens(text)
+    if not toks or len(toks) > 6:
+        return False
+    head = any(t in _LEX["s"] for t in toks)
+    tail = any(t in _LEX["w"] or t.startswith(tuple(_LEX["p"])) for t in toks)
+    return head and tail
+
+
+async def _shortcut(msg, context) -> bool:
+    """Шаблонные реакции на короткие фразы в ответ боту. True — сообщение обработано."""
+    if not msg or not msg.text or not is_directed_at_bot(msg):
+        return False
+    if EGG_RE.search(_fold(msg.text)):
+        try:
+            with open(ASSETS / "isagi.png", "rb") as f:
+                await msg.reply_photo(f, caption=_LEX["c"])
+        except OSError as e:
+            logger.warning(f"Картинка пасхалки недоступна: {e}")
+        return True
+    if _lex_hit(msg.text):
+        target = msg.reply_to_message
+        try:
+            await getattr(msg, _LEX["a"])()
+        except Exception as e:
+            logger.info(f"Быстрый ответ: {e}")
+        await context.bot.send_message(
+            msg.chat_id, _LEX["r"],
+            reply_to_message_id=target.message_id if target else None,
+            allow_sending_without_reply=True)
+        return True
+    return False
 
 
 # ─── Сохранение сообщений ─────────────────────────────────────────────────────
 async def store_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     chat_id = update.effective_chat.id
+    if await _shortcut(msg, context):
+        return
     await check_and_respond(update)
     if msg and msg.text:
         user = msg.from_user
         db_save(chat_id, user.first_name if user else "Unknown", (user.username or "").lower() if user else "", msg.text)
-        await maybe_auto_comment(chat_id, context)
 
 
 # ─── Построение промпта ───────────────────────────────────────────────────────
@@ -426,26 +475,59 @@ async def summary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await do_summary(chat_id, style, int(count_str), since, filter_parts, send_fn, edit_fn, delete_fn)
 
 
-# ─── /start ───────────────────────────────────────────────────────────────────
+# ─── /start и /help ──────────────────────────────────────────────────────────
+# В меню команд Telegram показываем только эти две: /start запускает бота, /help раскрывает всё остальное.
+MENU_COMMANDS = [
+    BotCommand("start", "Запустить бота"),
+    BotCommand("help", "Все команды и возможности"),
+]
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "👋 Привет! Я бот-суммаризатор.\n\n"
-        "Слежу за сообщениями и кратко пересказываю их по запросу.\n\n"
-        "📌 Команды:\n"
-        "  /summary — открыть меню резюме\n"
-        "  /count — сколько сообщений запомнено\n\n"
-        "🎡 Колесо удачи:\n"
-        "  /wheel — меню колеса\n"
-        "  /spin [колесо] — крутить\n"
-        "  /tierlist — тир-лист и шансы\n"
-        "  /addgame — добавить пункт или список\n"
-        "  /setweights — коэффициенты и лимиты тиров\n"
-        "  /setdecay — спад шанса после выпадения\n"
-        "  /wheels, /newwheel — свои колёса\n"
-        "  /wheelstats, /newevening — статистика, новый вечер\n"
-        "  /clearstats — очистить статистику колеса\n"
+        "👋 Привет! Я Нетрис.\n\n"
+        "Запоминаю переписку и по запросу пересказываю её, а ещё кручу колесо удачи. "
+        "Просто добавь меня в чат.\n\n"
+        "Все команды и возможности — /help."
     )
     await update.message.reply_text(text)
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📖 Что я умею\n\n"
+        "📋 Резюме чата\n"
+        "  /summary — меню резюме: за N сообщений или за N часов, обычное, тезисами или кратко\n"
+        "  /count — сколько сообщений запомнено\n\n"
+        "🎡 Колесо удачи\n"
+        "  /wheel — меню колеса\n"
+        "  /spin [колесо] — крутить\n"
+        "  /tierlist — все пункты и шансы\n"
+        "  /wheelstats — статистика, /clearstats — очистить её\n"
+        "  /newevening — новый вечер: шансы и слоты возвращаются\n\n"
+        "⚙️ Настройка колёс\n"
+        "  /addgame — добавить пункт или список (слоты: «Да ×2»)\n"
+        "  /setweights — коэффициенты и лимиты тиров\n"
+        "  /setdecay — спад шанса после выпадения\n"
+        "  /setmode — режим колеса: слоты или тир-лист\n"
+        "  /wheels — список колёс, /newwheel — создать новое\n"
+        "  /cancel — отменить текущий ввод\n\n"
+        "💬 Если ответить на моё сообщение или упомянуть меня, я могу отреагировать.\n\n"
+        "🕵️ У меня есть секреты. Подсказка №1: он из синей тюрьмы 🔵🔒. Все зовут его гением, "
+        "а главный талант — приспосабливаться на лету. Скажи это в ответ на моё сообщение."
+    )
+    await update.message.reply_text(text)
+
+
+async def post_init(app):
+    """Чистим меню команд: оставляем только /start и /help (в том числе перекрываем старые настройки из BotFather)."""
+    try:
+        for scope in (BotCommandScopeAllPrivateChats(), BotCommandScopeAllGroupChats(),
+                      BotCommandScopeAllChatAdministrators()):
+            await app.bot.delete_my_commands(scope=scope)
+        await app.bot.set_my_commands(MENU_COMMANDS)
+    except Exception as e:
+        logger.warning(f"Не удалось обновить меню команд: {e}")
 
 
 # ─── /count ───────────────────────────────────────────────────────────────────
@@ -464,7 +546,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     wheel.init_tables(DB_PATH)
-    app = ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
+    app = ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"]).post_init(post_init).build()
 
     # ConversationHandler для ввода числа/часов
     conv = ConversationHandler(
@@ -479,7 +561,7 @@ def main():
     )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("summary", summary))
     app.add_handler(CommandHandler("count", count_cmd))
     app.add_handler(conv)
