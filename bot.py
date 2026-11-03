@@ -28,6 +28,7 @@ from telegram.ext import (
 load_dotenv()
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # иначе в логах светится токен бота
 logger = logging.getLogger(__name__)
 
 client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ["OPENROUTER_API_KEY"])
@@ -35,6 +36,7 @@ MODEL = "deepseek/deepseek-v4-flash"
 BOT_USERNAME = "netrys_bot"
 
 MAX_MESSAGES = 1000
+SUMMARY_MAX_TOKENS = 6000  # включает reasoning-токены, поэтому с запасом
 DB_PATH = "messages.db"
 
 # Состояния ConversationHandler
@@ -112,15 +114,19 @@ def db_count(chat_id):
 
 
 # ─── ИИ ───────────────────────────────────────────────────────────────────────
-def ai(system, user, max_tokens=300):
+def ai(system, user, max_tokens=800):
     try:
         r = client.chat.completions.create(
             model=MODEL, max_tokens=max_tokens,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            extra_body={"reasoning": {"effort": "high", "exclude": True}}
+            extra_body={"reasoning": {"effort": "low", "exclude": True}}
         )
-        result = r.choices[0].message.content.strip()
-        return strip_reasoning(result)
+        choice = r.choices[0]
+        content = choice.message.content
+        if not content or not content.strip():
+            logger.error(f"Пустой ответ модели, finish_reason={choice.finish_reason}")
+            return None
+        return strip_reasoning(content.strip())
     except Exception as e:
         logger.error(f"Ошибка AI: {e}")
         return None
@@ -280,41 +286,39 @@ def build_prompt(messages, style, filter_desc):
 
 
 # ─── Очистка reasoning из ответа модели ──────────────────────────────────────
-def strip_reasoning(text: str) -> str:
-    """Убирает цепочки размышлений если модель думает вслух."""
-    # Убираем <think>...</think> блоки
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+def strip_reasoning(text) -> str:
+    """Убирает <think>...</think>, если модель вернула их в тексте. Безопасно для None."""
+    if not text:
+        return ""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
-    # Маркеры английских рассуждений — если встречаются, берём только последний русский абзац
-    reasoning_markers = [
-        "Let's craft", "Let's ", "So we need", "Need to", "I need to",
-        "I should", "I'll ", "We need", "This is", "The message",
-        "This appears", "This seems", "Let me", "First,", "Now,",
-    ]
-    has_reasoning = any(marker in text for marker in reasoning_markers)
 
-    if has_reasoning:
-        # Разбиваем на абзацы и берём последний русский
-        paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-        ru_paragraphs = []
-        for p in paragraphs:
-            ru_chars = sum(1 for c in p if 'а' <= c.lower() <= 'я' or c.lower() == 'ё')
-            if len(p) > 0 and ru_chars / len(p) > 0.25:
-                ru_paragraphs.append(p)
-        if ru_paragraphs:
-            return ru_paragraphs[-1]
-
-        # Если абзацев нет — берём последнее русское предложение
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        ru_sentences = []
-        for s in sentences:
-            ru_chars = sum(1 for c in s if 'а' <= c.lower() <= 'я' or c.lower() == 'ё')
-            if len(s) > 0 and ru_chars / len(s) > 0.25:
-                ru_sentences.append(s)
-        if ru_sentences:
-            return ru_sentences[-1]
-
-    return text
+def split_message(text: str, limit: int = 4000) -> list[str]:
+    """Режет текст на куски <= limit по абзацам, затем по строкам, затем по словам."""
+    chunks, cur = [], ""
+    for para in text.split("\n\n"):
+        # слишком длинный абзац режем на строки/слова
+        pieces = [para]
+        if len(para) > limit:
+            pieces = []
+            buf = ""
+            for word in para.replace("\n", " \n ").split(" "):
+                if len(buf) + len(word) + 1 > limit:
+                    pieces.append(buf)
+                    buf = ""
+                buf += (" " if buf else "") + word
+            if buf:
+                pieces.append(buf)
+        for piece in pieces:
+            sep = "\n\n" if cur else ""
+            if len(cur) + len(sep) + len(piece) > limit:
+                chunks.append(cur)
+                cur = piece
+            else:
+                cur += sep + piece
+    if cur:
+        chunks.append(cur)
+    return chunks
 
 
 # ─── Отправка резюме (общая функция) ─────────────────────────────────────────
@@ -329,16 +333,28 @@ async def do_summary(chat_id, style, count, since, filter_parts, send_fn, edit_f
     await edit_fn("⏳ Запрос в обработке, подожди...")
     try:
         prompt = build_prompt(filtered, style, filter_desc)
-        response = client.chat.completions.create(
-            model=MODEL, max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-            extra_body={"reasoning": {"effort": "high", "exclude": True}}
-        )
-        text = response.choices[0].message.content
-        # Пункт 3: убираем reasoning если модель всё равно думает вслух
-        text = strip_reasoning(text)
+        text, finish = None, None
+        for effort in ("low", "low"):  # вторая попытка, если ответ пришёл пустым
+            response = client.chat.completions.create(
+                model=MODEL, max_tokens=SUMMARY_MAX_TOKENS,
+                messages=[{"role": "user", "content": prompt}],
+                extra_body={"reasoning": {"effort": effort, "exclude": True}}
+            )
+            choice = response.choices[0]
+            finish = choice.finish_reason
+            text = strip_reasoning(choice.message.content)
+            if text:
+                break
+            logger.warning(f"Пустой ответ модели, finish_reason={finish}, пробую ещё раз")
+        if not text:
+            logger.error(f"Модель дважды вернула пустой ответ, finish_reason={finish}")
+            await edit_fn("❌ Модель вернула пустой ответ. Попробуй ещё раз или выбери стиль «Кратко».")
+            return
+        if finish == "length":
+            logger.warning("Резюме обрезано по max_tokens")
+            text += "\n\n⚠️ Ответ модели был обрезан по лимиту длины."
         full = f"📋 Резюме {len(filtered)} сообщений{filter_desc}{style_label}:\n\n{text}"
-        chunks = [full[i:i+4096] for i in range(0, len(full), 4096)]
+        chunks = split_message(full, 4000)
         await delete_fn()
         for chunk in chunks:
             await send_fn(chunk)
