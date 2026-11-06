@@ -32,7 +32,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # иначе в логах
 logger = logging.getLogger(__name__)
 
 client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ["OPENROUTER_API_KEY"])
-MODEL = "deepseek/deepseek-v4-flash"
+MODEL = "deepseek/deepseek-v4.1-flash-1017"
 BOT_USERNAME = "netrys_bot"
 
 MAX_MESSAGES = 1000
